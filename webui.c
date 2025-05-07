@@ -15,6 +15,42 @@
 #define MAX_HTML_BUF_SIZE 1024*1024 // 1MB limit to prevent excessive allocation
 #define HISTORY_POINTS 24 // Number of history points to show (e.g., last 24 checks)
 
+// Global storage for site configurations
+static SiteConfig g_site_configs[MAX_SITES];
+static int g_num_sites = 0;
+
+// Function to load site configurations from CONFIG_FILE
+// Returns the number of sites loaded, or -1 on error.
+int load_site_configurations() {
+    FILE *fp = fopen(CONFIG_FILE, "r");
+    if (fp == NULL) {
+        perror("Error opening config file for loading");
+        return -1;
+    }
+
+    g_num_sites = 0; // Reset before loading
+    char line[MAX_URL_LEN + 2];
+    while (fgets(line, sizeof(line), fp) != NULL && g_num_sites < MAX_SITES) {
+        line[strcspn(line, "\r\n")] = 0; // Remove newline
+        char *comment_start = strchr(line, '#'); // Remove comments
+        if (comment_start != NULL) *comment_start = '\0';
+        int len = strlen(line); // Trim trailing whitespace
+        while (len > 0 && isspace((unsigned char)line[len - 1])) line[--len] = '\0';
+        if (line[0] == '\0') continue; // Skip empty lines
+
+        if (strlen(line) < MAX_URL_LEN) {
+             strncpy(g_site_configs[g_num_sites].url, line, MAX_URL_LEN -1);
+             g_site_configs[g_num_sites].url[MAX_URL_LEN - 1] = '\0';
+             g_num_sites++;
+        } else {
+             fprintf(stderr, "Config Load: URL too long in %s: %s\n", CONFIG_FILE, line);
+        }
+    }
+    fclose(fp);
+    printf("Loaded %d sites from %s\n", g_num_sites, CONFIG_FILE);
+    return g_num_sites;
+}
+
 // Helper to append string safely to a dynamic buffer
 // Returns 0 on success, -1 on failure (e.g., allocation failed)
 static int append_to_buffer(char **buffer, size_t *buffer_size, size_t *current_len, const char *str_to_append) {
@@ -67,39 +103,18 @@ enum MHD_Result request_handler(void *cls, struct MHD_Connection *connection,
 
     if (0 != strcmp(method, "GET")) return MHD_NO; // Only GET
 
-    // --- Read sites from config file ---
-    char sites[MAX_SITES][MAX_URL_LEN];
-    int num_sites = 0;
-    FILE *fp = fopen(CONFIG_FILE, "r");
-    if (fp == NULL) {
-        perror("WebUI Error opening config file");
-        // Return a simple error page
-        const char *error_page = "<html><body><h1>Error</h1><p>Could not read site configuration.</p></body></html>";
+    // --- Use pre-loaded site configurations ---
+    if (g_num_sites <= 0) {
+        // This case should ideally be handled at startup,
+        // but as a fallback, show an error if no sites are loaded.
+        fprintf(stderr, "WebUI: No site configurations loaded.\n");
+        const char *error_page = "<html><body><h1>Error</h1><p>No site configurations available. Check server logs.</p></body></html>";
         struct MHD_Response *response = MHD_create_response_from_buffer(strlen(error_page), (void *)error_page, MHD_RESPMEM_MUST_COPY);
         MHD_add_response_header(response, "Content-Type", "text/html");
         enum MHD_Result ret = MHD_queue_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, response);
         MHD_destroy_response(response);
         return ret;
     }
-
-    char line[MAX_URL_LEN + 2];
-    while (fgets(line, sizeof(line), fp) != NULL && num_sites < MAX_SITES) {
-        line[strcspn(line, "\r\n")] = 0; // Remove newline
-        char *comment_start = strchr(line, '#'); // Remove comments
-        if (comment_start != NULL) *comment_start = '\0';
-        int len = strlen(line); // Trim trailing whitespace
-        while (len > 0 && isspace((unsigned char)line[len - 1])) line[--len] = '\0';
-        if (line[0] == '\0') continue; // Skip empty lines
-
-        if (strlen(line) < MAX_URL_LEN) {
-             strncpy(sites[num_sites], line, MAX_URL_LEN -1);
-             sites[num_sites][MAX_URL_LEN - 1] = '\0';
-             num_sites++;
-        } else {
-             fprintf(stderr, "WebUI: URL too long in %s: %s\n", CONFIG_FILE, line);
-        }
-    }
-    fclose(fp);
 
     // --- Dynamically generate HTML ---
     size_t html_buf_size = INITIAL_HTML_BUF_SIZE;
@@ -181,8 +196,8 @@ enum MHD_Result request_handler(void *cls, struct MHD_Connection *connection,
 
 
     // --- Generate Table Rows for each site ---
-    for (int i = 0; i < num_sites; i++) {
-        const char* target_url = sites[i];
+    for (int i = 0; i < g_num_sites; i++) {
+        const char* target_url = g_site_configs[i].url;
         long response_code = 0;
         double response_time = 0.0;
         int is_up = get_latest_status(target_url, &response_code, &response_time);
@@ -308,13 +323,26 @@ enum MHD_Result request_handler(void *cls, struct MHD_Connection *connection,
 }
 
 void start_web_server() {
+    // Load site configurations at startup
+    if (load_site_configurations() < 0) {
+        fprintf(stderr, "Failed to load site configurations. Web server will not start with site data.\n");
+        // Depending on desired behavior, you might choose to exit or run without sites.
+        // For now, we'll print an error and continue, the request_handler will show an error page.
+    } else if (g_num_sites == 0) {
+        fprintf(stdout, "Warning: No sites found in %s or all were invalid.\n", CONFIG_FILE);
+    }
+
+
     struct MHD_Daemon *daemon = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, 8080, NULL, NULL,
                                                  &request_handler, NULL, MHD_OPTION_END);
-    if (NULL == daemon) { /* Handle error */ 
-        printf("Failed to start web server.\n");
-        return; 
+    if (NULL == daemon) { /* Handle error */
+        fprintf(stderr, "Failed to start web server daemon.\n");
+        return;
     }
     printf("Web server started on port 8080. Press Enter to stop.\n");
     (void)getchar(); // Keep server running until Enter is pressed
     MHD_stop_daemon(daemon);
+    // Note: Memory for g_site_configs is static, so no explicit free needed here unless
+    // it was dynamically allocated (which it isn't in this static array approach).
+    // If SiteConfig structs contained dynamically allocated members, they'd need freeing.
 }
