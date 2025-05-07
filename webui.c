@@ -133,7 +133,7 @@ enum MHD_Result request_handler(void *cls, struct MHD_Connection *connection,
     html_buffer[0] = '\0'; // Start with an empty string
 
     // Increase temp_buf size: Max URL length + ~1KB for other fields, history bar, and tags
-    char temp_buf[MAX_URL_LEN + 1024]; 
+    char temp_buf[8500];
     char header_buf[256]; // Buffer specifically for the table header
 
     // --- Start HTML Document ---
